@@ -241,6 +241,15 @@
     <div class="status-row"><span class="lbl">Idioma</span> <span class="val" id="lang-status">pt-PT</span></div>
     <div class="status-row"><span class="lbl">Keys configuradas</span> <span class="val" id="keys-status">0</span></div>
     <div class="status-row"><span class="lbl">Plataforma</span> <span class="val" id="platform-status">?</span></div>
+    <div class="status-row" style="margin-top:8px; padding-top:10px; border-top:1px solid var(--border);">
+      <label for="text-only-toggle" style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1;">
+        <input type="checkbox" id="text-only-toggle" style="width:18px; height:18px; accent-color:var(--accent);">
+        <div style="flex:1;">
+          <div style="font-weight:600; font-size:14px;">🗑 Modo só-texto</div>
+          <div style="color:var(--text-secondary); font-size:12px; line-height:1.3; margin-top:2px;">Apaga o áudio após transcrever. Fica só texto (~5 KB em vez de ~30 MB por reunião).</div>
+        </div>
+      </label>
+    </div>
   </div>
 
   <div class="profile-bar">
@@ -391,6 +400,23 @@ document.getElementById('profile-input').value = localStorage.getItem('profile')
 document.getElementById('profile-input').addEventListener('change', e => {
   localStorage.setItem('profile', e.target.value);
 });
+
+// Text-only mode — delete audio after successful transcription.
+// Default ON (saves ~30 MB per recording vs ~5 KB metadata only).
+const textOnlyToggle = document.getElementById('text-only-toggle');
+const textOnlyStored = localStorage.getItem('text_only_mode');
+textOnlyToggle.checked = textOnlyStored === null ? true : textOnlyStored === '1';
+if (textOnlyStored === null) localStorage.setItem('text_only_mode', '1');
+textOnlyToggle.addEventListener('change', e => {
+  localStorage.setItem('text_only_mode', e.target.checked ? '1' : '0');
+  showToast(e.target.checked
+    ? '🗑 Modo só-texto ON — áudio apagado após transcrever'
+    : '💾 Modo só-texto OFF — áudio guardado'
+  );
+});
+function textOnlyMode() {
+  return localStorage.getItem('text_only_mode') !== '0';
+}
 
 // ── Modals ──────────────────────────────────────────────────────────────
 function openKeysModal() {
@@ -638,6 +664,10 @@ async function onRecordingStopped() {
 async function transcribeRecording(id) {
   const rec = await idbGet(id);
   if (!rec) return;
+  if (!rec.blob) {
+    showToast('⚠️ Áudio foi apagado — não dá para re-transcrever', 3500);
+    return;
+  }
   if (!keyRotator.count()) {
     showToast('⚠️ Configura a API key primeiro', 3000);
     return;
@@ -695,9 +725,21 @@ async function transcribeRecording(id) {
       rec.transcript = text;
       rec.transcript_status = 'done';
       rec.transcribe_dt_s = dt;
+      // 🗑 Text-only mode: drop the audio blob now that we have the text.
+      // Recording shrinks from ~30 MB to ~5 KB. User can disable in
+      // the status card if they want to keep audio for re-listening.
+      if (textOnlyMode()) {
+        const savedMB = (rec.blob_size / 1024 / 1024).toFixed(1);
+        delete rec.blob;
+        rec.audio_deleted = true;
+        rec.audio_freed_mb = savedMB;
+      }
       await idbPut(rec);
       await renderRecordings();
-      showToast(`✓ Transcrito em ${dt}s · ${text.length} chars`);
+      const sizeMsg = rec.audio_deleted
+        ? ` · 🗑 áudio apagado (poupou ${rec.audio_freed_mb} MB)`
+        : '';
+      showToast(`✓ Transcrito em ${dt}s · ${text.length} chars${sizeMsg}`);
       return;
     } catch (e) {
       lastErr = e.message || String(e);
@@ -712,20 +754,32 @@ async function transcribeRecording(id) {
   showToast(`❌ Transcrição falhou: ${lastErr}`, 4000);
 }
 
+// ── Delete audio only (keep transcript) ────────────────────────────────
+async function deleteAudioOnly(id) {
+  const rec = await idbGet(id);
+  if (!rec || !rec.blob) return;
+  if (!confirm(`Apagar só o áudio desta gravação? Mantém o texto transcrito.\n\nVai poupar ${(rec.blob_size / 1024 / 1024).toFixed(1)} MB.`)) return;
+  rec.audio_freed_mb = (rec.blob_size / 1024 / 1024).toFixed(1);
+  delete rec.blob;
+  rec.audio_deleted = true;
+  await idbPut(rec);
+  await renderRecordings();
+  showToast(`🗑 Áudio apagado (poupou ${rec.audio_freed_mb} MB)`);
+}
+
 // ── Share ──────────────────────────────────────────────────────────────
 async function shareRecording(id) {
   const rec = await idbGet(id);
   if (!rec) return;
   const date = new Date(rec.id).toISOString().slice(0, 16).replace('T', '-');
   const safeProfile = (rec.profile || 'meeting').replace(/[^\w\-]/g, '_');
-  const audioName = `${date}-${safeProfile}.${rec.mime_type.includes('mp4') ? 'm4a' : 'webm'}`;
 
   // Build .md content
   let md = `# Meeting — ${rec.created_at}\n\n`;
   md += `- Profile: ${rec.profile}\n`;
   md += `- Duração: ${fmtTime(rec.duration_ms)}\n`;
   md += `- Idioma hint: ${rec.lang_hint}\n`;
-  md += `- Tamanho áudio: ${(rec.blob_size / 1024 / 1024).toFixed(1)} MB\n`;
+  md += `- Tamanho áudio original: ${(rec.blob_size / 1024 / 1024).toFixed(1)} MB${rec.audio_deleted ? ' (apagado após transcrever)' : ''}\n`;
   md += `- Engine: Voxtral REST · ${MISTRAL_MODEL}\n\n`;
   if (rec.transcript) {
     md += `## Transcript\n\n${rec.transcript}\n`;
@@ -734,17 +788,22 @@ async function shareRecording(id) {
   }
   const mdBlob = new Blob([md], { type: 'text/markdown' });
   const mdName = `${date}-${safeProfile}.md`;
-
-  const audioFile = new File([rec.blob], audioName, { type: rec.mime_type });
   const mdFile = new File([mdBlob], mdName, { type: 'text/markdown' });
 
+  // Build files array — only include audio if not deleted
+  const files = [mdFile];
+  if (rec.blob) {
+    const audioName = `${date}-${safeProfile}.${rec.mime_type.includes('mp4') ? 'm4a' : 'webm'}`;
+    files.unshift(new File([rec.blob], audioName, { type: rec.mime_type }));
+  }
+
   // Try Web Share API with files (best UX — opens native share sheet)
-  if (navigator.canShare && navigator.canShare({ files: [audioFile, mdFile] })) {
+  if (navigator.canShare && navigator.canShare({ files })) {
     try {
       await navigator.share({
         title: `Reunião ${date}`,
         text: rec.profile,
-        files: [audioFile, mdFile],
+        files,
       });
       return;
     } catch (e) {
@@ -752,14 +811,14 @@ async function shareRecording(id) {
       console.warn('[share] failed:', e);
     }
   }
-  // Fallback: download both files
-  for (const f of [audioFile, mdFile]) {
+  // Fallback: download files
+  for (const f of files) {
     const url = URL.createObjectURL(f);
     const a = document.createElement('a');
     a.href = url; a.download = f.name; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
-  showToast('📥 Ficheiros descarregados');
+  showToast(`📥 ${files.length} ficheiro${files.length > 1 ? 's' : ''} descarregado${files.length > 1 ? 's' : ''}`);
 }
 
 async function deleteRecording(id) {
@@ -797,18 +856,25 @@ async function renderRecordings() {
     } else if (rec.error) {
       transcriptBlock = `<div class="recording-transcript" style="color:var(--danger)">${escapeHtml(rec.error)}</div>`;
     }
+    const audioStatus = rec.audio_deleted
+      ? `· 🗑 áudio apagado (poupou ${rec.audio_freed_mb} MB)`
+      : `· ${sizeMB} MB`;
+    const showDeleteAudio = !rec.audio_deleted && rec.transcript_status === 'done' && rec.blob;
     return `
       <div class="recording">
         <div class="recording-header">
           <div class="recording-title">${escapeHtml(rec.profile || '(sem profile)')}</div>
           ${statusPill}
         </div>
-        <div class="recording-meta">${dateStr} · ${fmtTime(rec.duration_ms)} · ${sizeMB} MB ${rec.transcribe_dt_s ? '· transcrito em ' + rec.transcribe_dt_s + 's' : ''}</div>
+        <div class="recording-meta">${dateStr} · ${fmtTime(rec.duration_ms)} ${audioStatus} ${rec.transcribe_dt_s ? '· transcrito em ' + rec.transcribe_dt_s + 's' : ''}</div>
         ${transcriptBlock}
         <div class="recording-actions">
           ${rec.transcript_status === 'done' || rec.transcript_status === 'transcribing'
-            ? '' : `<button class="action-btn primary" onclick="transcribeRecording(${rec.id})">🌐 Transcrever</button>`}
+            ? '' : rec.audio_deleted
+              ? '<button class="action-btn" disabled style="opacity:0.5">⚠️ Sem áudio</button>'
+              : `<button class="action-btn primary" onclick="transcribeRecording(${rec.id})">🌐 Transcrever</button>`}
           <button class="action-btn" onclick="shareRecording(${rec.id})">📤 Share</button>
+          ${showDeleteAudio ? `<button class="action-btn" onclick="deleteAudioOnly(${rec.id})" title="Apagar só o áudio, manter texto">🗑🎙</button>` : ''}
           <button class="action-btn danger" onclick="deleteRecording(${rec.id})">🗑</button>
         </div>
       </div>
