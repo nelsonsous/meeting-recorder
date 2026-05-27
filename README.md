@@ -64,16 +64,26 @@ mobile-recorder/
 6. Tap **🌐 Transcrever** → ~70s para 1h de áudio.
 7. Tap **📤 Share** → envia áudio + transcrição (.md) via AirDrop / iCloud / WhatsApp / Mail.
 
-## Limitações iOS
+## Limitações iOS (mitigadas)
 
-| Problema | Workaround |
-|---|---|
-| Safari mata audio em background após ~10 min | Mantém em foreground com ecrã dim |
-| Não suporta `wakeLock` API | Usa silent-audio trick (built-in) |
-| MediaRecorder só suporta MP4/AAC | App detecta e usa o codec certo |
+| Problema | Mitigação implementada | Resultado |
+|---|---|---|
+| Safari mata audio em background | Silent MP3 loop em `<audio>` element | iOS trata como music player → background **praticamente ilimitado** quando PWA instalada via Home Screen |
+| Não suporta `wakeLock` API | Silent audio é alternativa | ✓ |
+| MediaRecorder só MP4/AAC | App auto-detecta + usa codec correcto | ✓ |
+| Locked screen termina sessão | "Now Playing" aparece no Control Center (porque somos music player) | Continua a gravar mesmo com ecrã off |
 
-Para reuniões longas (1h+) com ecrã totalmente off, considera Voice
-Memos nativa (ilimitado em background) + AirDrop para Mac depois.
+**Importante para o iPhone funcionar bem em background**:
+1. Instala a PWA via **Add to Home Screen** (NÃO uses só num tab Safari)
+2. Abre **sempre pelo ícone do home screen**, não pelo URL no Safari
+3. Quando vais a tap ▶ Start, o silent MP3 começa a tocar — vais ver "Meeting Recorder" na Now Playing do Control Center (normal e esperado)
+4. Ecrã pode desligar; podes mesmo ir para outra app
+5. Tap o ícone do home screen ou Now Playing para voltar e fazer Stop
+
+**Se mesmo assim parar antes de Stop**:
+- Confirma que a PWA é mesmo PWA (sem barra Safari quando abres)
+- Audio Output não pode estar mudo no telemóvel (mesmo sendo silencioso, iOS verifica que algum output existe)
+- Se houver outra app a tocar audio (Spotify, etc.), pode interferir — pausa essas primeiro
 
 ## Segurança da API key
 

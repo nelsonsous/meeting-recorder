@@ -295,6 +295,16 @@
   </div>
 </div>
 
+<!--
+  iOS background-recording trick: a hidden silent MP3 in loop. iOS
+  treats us as a "music player" → grants Background Audio capability.
+  Combined with `apple-mobile-web-app-capable=yes` + installed from
+  Home Screen, this extends background recording effectively
+  indefinitely (vs. ~5-10 min with Web Audio oscillator).
+  Loaded but not played until recording starts.
+-->
+<audio id="silent-audio" src="silent.mp3" loop preload="auto" playsinline></audio>
+
 <div id="toast" class="toast"></div>
 
 <script>
@@ -503,26 +513,41 @@ function releaseWakeLock() {
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
 
-// iOS background trick: play inaudible audio via Web Audio API to keep
-// the audio session "active". Safari treats us like a music player and
-// gives more leniency in background. Not bulletproof — Safari may still
-// kill after ~10 minutes.
-function startSilentAudio() {
-  if (!platform.isIOS) return;
+// iOS background-recording trick: play a silent MP3 in loop via a
+// regular <audio> element (not Web Audio API). This makes iOS treat us
+// as a "music player" → the OS grants Background Audio capability and
+// keeps the page suspended-but-alive instead of fully killing it.
+// Empirically this extends background recording from ~5-10 min (Web
+// Audio oscillator approach) to essentially indefinite, as long as the
+// PWA was installed from Home Screen (Add to Home Screen) — not just
+// opened in a Safari tab.
+//
+// Caveats:
+//   - iOS Control Center will show "Now Playing" with the page favicon.
+//     This is the OS recognising us as a music player — expected.
+//   - The user MUST start the audio in response to a user gesture
+//     (touch). We call this from inside the click handler chain.
+//   - On Android the silent audio is harmless but unnecessary
+//     (wakeLock is the canonical path there).
+async function startSilentAudio() {
   try {
-    silentAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    silentNode = silentAudioCtx.createOscillator();
-    const gain = silentAudioCtx.createGain();
-    gain.gain.value = 0.0001;  // effectively silent
-    silentNode.frequency.value = 20000;  // beyond human hearing
-    silentNode.connect(gain);
-    gain.connect(silentAudioCtx.destination);
-    silentNode.start();
-  } catch (e) { console.warn('[silent-audio] failed:', e); }
+    const el = document.getElementById('silent-audio');
+    if (!el) return;
+    el.volume = 0.001;          // essentially silent
+    el.muted = false;             // counter-intuitive: must NOT be muted on iOS
+    el.loop = true;
+    // play() returns a promise; must be inside a user-gesture callback
+    await el.play();
+    console.log('[silent-audio] playing (background-keepalive enabled)');
+  } catch (e) {
+    console.warn('[silent-audio] play failed:', e);
+  }
 }
 function stopSilentAudio() {
-  if (silentNode) { try { silentNode.stop(); } catch {} silentNode = null; }
-  if (silentAudioCtx) { silentAudioCtx.close().catch(() => {}); silentAudioCtx = null; }
+  try {
+    const el = document.getElementById('silent-audio');
+    if (el) { el.pause(); el.currentTime = 0; }
+  } catch {}
 }
 
 async function toggleRecording() {
