@@ -222,7 +222,7 @@
 <body>
 
 <header>
-  <h1>🎙 Meeting Recorder <span style="font-size:11px; color:var(--text-secondary); font-weight:500; letter-spacing:0.5px;">v3</span></h1>
+  <h1>🎙 Meeting Recorder <span style="font-size:11px; color:var(--text-secondary); font-weight:500; letter-spacing:0.5px;">v5</span></h1>
   <div class="actions">
     <button class="icon-btn" onclick="openKeysModal()" title="API Keys">🔑</button>
     <button class="icon-btn" onclick="openLangModal()" title="Idioma">🌐</button>
@@ -336,14 +336,26 @@ const platform = (() => {
   const ua = navigator.userAgent;
   const isIOS = /iPad|iPhone|iPod/.test(ua) && !window.MSStream;
   const isAndroid = /Android/.test(ua);
+  // Probe MediaRecorder support — order matters: most-compatible first.
+  // iOS Safari is notoriously picky and silently produces 0-byte blobs
+  // when the requested mimeType isn't fully supported. We try a series
+  // of candidates and pick the first that `isTypeSupported()` confirms,
+  // then validate at recording time too.
+  const candidates = isIOS
+    ? ['audio/mp4', 'audio/aac', 'audio/mp4;codecs=mp4a.40.2', '']  // '' = browser default
+    : ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', ''];
+  let pickedMime = '';
+  for (const c of candidates) {
+    try {
+      if (c === '' || MediaRecorder.isTypeSupported(c)) { pickedMime = c; break; }
+    } catch {}
+  }
   return {
     isIOS, isAndroid,
     hasWakeLock: 'wakeLock' in navigator,
     name: isIOS ? 'iOS' : isAndroid ? 'Android' : 'Desktop',
-    // Best supported MIME types per platform
-    mimeType: isIOS
-      ? (MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : 'audio/aac')
-      : (MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm'),
+    mimeType: pickedMime,                 // may be '' → browser picks
+    mimeTypeTried: candidates,
   };
 })();
 
@@ -592,35 +604,81 @@ async function startRecording() {
     openKeysModal();
     return;
   }
+  // iOS Safari/PWA quirk: the silent-MP3 trick must be primed BEFORE
+  // getUserMedia to keep the audio session in "playAndRecord" mode.
+  // Starting it here (still inside the user-gesture chain) maximises
+  // the chance MediaRecorder actually delivers PCM data.
+  await startSilentAudio();
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
-        sampleRate: 16000,
+        // No sampleRate constraint — iOS often refuses 16k requests and
+        // silently produces 0-byte recordings. Let device pick (usually
+        // 44.1k or 48k) and we resample server-side via Voxtral.
       },
     });
-    mediaRecorder = new MediaRecorder(stream, { mimeType: platform.mimeType });
+    // Build MediaRecorder, falling back across candidates if the picked
+    // mime fails to instantiate. iOS sometimes lies about isTypeSupported.
+    let mr = null;
+    let usedMime = platform.mimeType;
+    const tryList = [platform.mimeType, ...platform.mimeTypeTried].filter(
+      (v, i, a) => a.indexOf(v) === i
+    );
+    for (const m of tryList) {
+      try {
+        mr = m ? new MediaRecorder(stream, { mimeType: m })
+               : new MediaRecorder(stream);
+        usedMime = m || mr.mimeType || 'audio/webm';
+        console.log('[recorder] using mimeType:', usedMime);
+        break;
+      } catch (err) {
+        console.warn('[recorder] mimeType failed:', m, err.message);
+      }
+    }
+    if (!mr) {
+      throw new Error('No supported MediaRecorder format');
+    }
+    mediaRecorder = mr;
+    platform.mimeType = usedMime;  // remember what actually worked
     recordedChunks = [];
+    let chunkCount = 0;
     mediaRecorder.ondataavailable = e => {
-      if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      if (e.data && e.data.size > 0) {
+        recordedChunks.push(e.data);
+        chunkCount++;
+        // Log first few to confirm capture
+        if (chunkCount <= 3) console.log(`[recorder] chunk #${chunkCount}: ${e.data.size}B`);
+      }
     };
     mediaRecorder.onstop = onRecordingStopped;
     mediaRecorder.onerror = e => {
       console.error('[recorder] error:', e);
       showToast('❌ Erro na gravação', 3500);
     };
-    mediaRecorder.start(1000);  // emit chunk every 1s — robust to crashes
+    // iOS quirk: passing a timeslice to .start() (e.g. .start(1000))
+    // often causes 0-byte deliveries. Letting iOS choose its own slice
+    // (call .requestData() periodically OR just rely on .stop()) is
+    // more reliable. On Android, 1000ms works fine.
+    if (platform.isIOS) {
+      mediaRecorder.start();   // single big chunk on stop
+    } else {
+      mediaRecorder.start(1000);  // emit chunk every 1s — robust on Android
+    }
     recordStart = Date.now();
     document.getElementById('record-btn').classList.add('recording');
     document.getElementById('timer').classList.add('recording');
-    document.getElementById('record-status').innerHTML = '🔴 A gravar… <span style="color:var(--text-secondary)">(toca para parar)</span>';
+    document.getElementById('record-status').innerHTML = `🔴 A gravar (${usedMime.split(';')[0]})… <span style="color:var(--text-secondary)">(toca para parar)</span>`;
     timerInterval = setInterval(tickTimer, 200);
     await acquireWakeLock();
-    startSilentAudio();
   } catch (e) {
-    console.error('[mic] permission failed:', e);
-    showToast('❌ Permissão de microfone negada', 3500);
+    console.error('[mic] start failed:', e);
+    stopSilentAudio();
+    const msg = e.name === 'NotAllowedError'
+      ? '❌ Permissão de microfone negada. Settings → Safari → Microfone → Permitir'
+      : `❌ Erro: ${e.message || e.name}`;
+    showToast(msg, 5000);
   }
 }
 
@@ -668,6 +726,20 @@ async function transcribeRecording(id) {
   if (!rec) return;
   if (!rec.blob) {
     showToast('⚠️ Áudio foi apagado — não dá para re-transcrever', 3500);
+    return;
+  }
+  // Empty/tiny blob check — Mistral rejects with confusing 400 if we
+  // upload 0-byte audio. Catch the case early.
+  if (rec.blob.size < 1024) {
+    rec.transcript_status = 'error';
+    rec.error = `Áudio vazio ou inválido (${rec.blob.size} bytes). ` +
+                `Causa típica: permissão de microfone bloqueada, ou MediaRecorder ` +
+                `não capturou (codec). Vai a Settings → Safari → Microfone → ` +
+                `Permitir, e tenta uma gravação nova. ` +
+                `Codec tentado: ${rec.mime_type}.`;
+    await idbPut(rec);
+    await renderRecordings();
+    showToast('❌ Áudio vazio (0 bytes) — verifica permissão mic', 5000);
     return;
   }
   if (!keyRotator.count()) {
