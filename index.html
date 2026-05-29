@@ -222,12 +222,16 @@
 <body>
 
 <header>
-  <h1>🎙 Meeting Recorder <span style="font-size:11px; color:var(--text-secondary); font-weight:500; letter-spacing:0.5px;">v5</span></h1>
+  <h1>🎙 Meeting Recorder <span style="font-size:11px; color:var(--text-secondary); font-weight:500; letter-spacing:0.5px;">v6</span></h1>
   <div class="actions">
+    <button class="icon-btn" onclick="document.getElementById('import-input').click()" title="Importar áudio">📥</button>
     <button class="icon-btn" onclick="openKeysModal()" title="API Keys">🔑</button>
     <button class="icon-btn" onclick="openLangModal()" title="Idioma">🌐</button>
   </div>
 </header>
+
+<!-- Hidden file picker for import. Accepts any audio format. -->
+<input type="file" id="import-input" accept="audio/*,.m4a,.mp3,.wav,.webm,.ogg,.aac,.opus,.flac" style="display:none" onchange="onImportFile(event)">
 
 <main>
   <div id="ios-warn" class="ios-note" style="display:none">
@@ -895,6 +899,122 @@ async function shareRecording(id) {
   showToast(`📥 ${files.length} ficheiro${files.length > 1 ? 's' : ''} descarregado${files.length > 1 ? 's' : ''}`);
 }
 
+// ── Import audio file (Voice Memos export, etc.) ─────────────────────
+async function onImportFile(event) {
+  const file = event.target.files?.[0];
+  // Reset input so the same file can be re-imported later if needed
+  event.target.value = '';
+  if (!file) return;
+  if (!file.type.startsWith('audio/') && !/\.(m4a|mp3|wav|webm|ogg|aac|opus|flac)$/i.test(file.name)) {
+    showToast(`❌ Não é áudio: ${file.type || file.name}`, 3500);
+    return;
+  }
+  showToast(`📥 A importar "${file.name}"…`, 2000);
+  // Try to read audio duration (decodes header only, fast)
+  let durationMs = 0;
+  try {
+    durationMs = await getAudioDuration(file);
+  } catch (e) {
+    console.warn('[import] duration probe failed:', e);
+  }
+  const profile = document.getElementById('profile-input').value.trim();
+  // Use Date.now() but salt with file lastModified to dedupe rapid imports
+  const id = Date.now();
+  const rec = {
+    id,
+    blob: file,                       // File extends Blob — works directly with FormData
+    blob_size: file.size,
+    mime_type: file.type || guessMime(file.name),
+    original_filename: file.name,
+    duration_ms: durationMs,
+    created_at: new Date().toISOString(),
+    profile: profile || file.name.replace(/\.[^.]+$/, ''),
+    lang_hint: currentLang,
+    transcript: null,
+    transcript_status: 'pending',
+    error: null,
+    imported: true,                   // distinguish from in-app recordings
+  };
+  await idbPut(rec);
+  await renderRecordings();
+  showToast(
+    `✓ Importado (${(file.size / 1024 / 1024).toFixed(1)} MB${durationMs ? ', ' + fmtTime(durationMs) : ''})`,
+    3000
+  );
+}
+
+function guessMime(filename) {
+  const ext = (filename || '').toLowerCase().split('.').pop();
+  return {
+    m4a: 'audio/mp4', mp4: 'audio/mp4', aac: 'audio/aac',
+    mp3: 'audio/mpeg', wav: 'audio/wav',
+    webm: 'audio/webm', ogg: 'audio/ogg', opus: 'audio/opus',
+    flac: 'audio/flac',
+  }[ext] || 'audio/mpeg';
+}
+
+// Read audio duration without playing — useful for imported files.
+function getAudioDuration(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const audio = new Audio();
+    audio.preload = 'metadata';
+    audio.onloadedmetadata = () => {
+      URL.revokeObjectURL(url);
+      // Some streamed formats report Infinity until played; fall back to 0
+      const d = isFinite(audio.duration) ? audio.duration * 1000 : 0;
+      resolve(Math.round(d));
+    };
+    audio.onerror = (e) => {
+      URL.revokeObjectURL(url);
+      reject(e);
+    };
+    audio.src = url;
+  });
+}
+
+// ── Export AUDIO ONLY (without transcript .md) ─────────────────────────
+// Useful when you want to AirDrop just the audio to the Mac for the full
+// re-transcription pipeline (Voxtral API + WhisperX + diarization).
+async function exportAudioOnly(id) {
+  const rec = await idbGet(id);
+  if (!rec) return;
+  if (!rec.blob) {
+    showToast('⚠️ Áudio foi apagado (modo só-texto). Nada para exportar.', 3500);
+    return;
+  }
+  const date = new Date(rec.id).toISOString().slice(0, 16).replace('T', '-');
+  const safeProfile = (rec.profile || 'meeting').replace(/[^\w\-]/g, '_');
+  const ext = rec.original_filename
+    ? rec.original_filename.split('.').pop()
+    : (rec.mime_type.includes('mp4') ? 'm4a'
+        : rec.mime_type.includes('webm') ? 'webm'
+        : rec.mime_type.includes('mpeg') ? 'mp3'
+        : 'audio');
+  const filename = `${date}-${safeProfile}.${ext}`;
+  const file = new File([rec.blob], filename, { type: rec.mime_type });
+  // Web Share API with single file is the cleanest UX
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({
+        title: filename,
+        text: rec.profile,
+        files: [file],
+      });
+      return;
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      console.warn('[exportAudio] share failed:', e);
+    }
+  }
+  // Fallback: direct download
+  const url = URL.createObjectURL(file);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast('📥 Áudio descarregado');
+}
+
 async function deleteRecording(id) {
   if (!confirm('Apagar esta gravação? Não pode ser desfeito.')) return;
   await idbDelete(id);
@@ -947,9 +1067,10 @@ async function renderRecordings() {
             ? '' : rec.audio_deleted
               ? '<button class="action-btn" disabled style="opacity:0.5">⚠️ Sem áudio</button>'
               : `<button class="action-btn primary" onclick="transcribeRecording(${rec.id})">🌐 Transcrever</button>`}
-          <button class="action-btn" onclick="shareRecording(${rec.id})">📤 Share</button>
+          <button class="action-btn" onclick="shareRecording(${rec.id})" title="Partilhar tudo (áudio + transcript .md)">📤 Tudo</button>
+          ${rec.blob && !rec.audio_deleted ? `<button class="action-btn" onclick="exportAudioOnly(${rec.id})" title="Partilhar só o áudio">🎙</button>` : ''}
           ${showDeleteAudio ? `<button class="action-btn" onclick="deleteAudioOnly(${rec.id})" title="Apagar só o áudio, manter texto">🗑🎙</button>` : ''}
-          <button class="action-btn danger" onclick="deleteRecording(${rec.id})">🗑</button>
+          <button class="action-btn danger" onclick="deleteRecording(${rec.id})" title="Apagar tudo">🗑</button>
         </div>
       </div>
     `;
