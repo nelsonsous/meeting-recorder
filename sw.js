@@ -2,7 +2,7 @@
 // Strategy: cache-first for the app shell, network-only for Mistral API calls.
 // Recordings live in IndexedDB (handled in app.js, not here).
 
-const CACHE_NAME = 'meeting-recorder-v6';
+const CACHE_NAME = 'meeting-recorder-v7';
 const SHELL = [
   './',
   './index.html',

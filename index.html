@@ -222,9 +222,10 @@
 <body>
 
 <header>
-  <h1>🎙 Meeting Recorder <span style="font-size:11px; color:var(--text-secondary); font-weight:500; letter-spacing:0.5px;">v6</span></h1>
+  <h1>🎙 Meeting Recorder <span style="font-size:11px; color:var(--text-secondary); font-weight:500; letter-spacing:0.5px;">v7</span></h1>
   <div class="actions">
     <button class="icon-btn" onclick="document.getElementById('import-input').click()" title="Importar áudio">📥</button>
+    <button class="icon-btn" onclick="openSettingsModal()" title="Configurações">⚙</button>
     <button class="icon-btn" onclick="openKeysModal()" title="API Keys">🔑</button>
     <button class="icon-btn" onclick="openLangModal()" title="Idioma">🌐</button>
   </div>
@@ -284,6 +285,48 @@
     <div class="modal-actions">
       <button class="cancel" onclick="closeKeysModal()">Cancelar</button>
       <button class="ok" onclick="saveKeys()">Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings modal: transcription mode + paragraphs -->
+<div id="settings-modal" class="modal-bg">
+  <div class="modal">
+    <h3>⚙ Configurações</h3>
+    <p>Como queres que o Mistral devolva a transcrição.</p>
+    <div style="margin-bottom:14px; display:flex; flex-direction:column; gap:8px;">
+      <label style="display:flex; align-items:start; gap:10px; padding:10px 12px; background:var(--surface-2); border-radius:8px; cursor:pointer;">
+        <input type="radio" name="tx-mode" value="plain" style="margin-top:2px; accent-color:var(--accent);">
+        <div>
+          <div style="font-weight:600;">⚡ Texto corrido</div>
+          <div style="color:var(--text-secondary); font-size:13px;">Mais rápido. Texto contínuo sem marcas.</div>
+        </div>
+      </label>
+      <label style="display:flex; align-items:start; gap:10px; padding:10px 12px; background:var(--surface-2); border-radius:8px; cursor:pointer;">
+        <input type="radio" name="tx-mode" value="timestamps" style="margin-top:2px; accent-color:var(--accent);">
+        <div>
+          <div style="font-weight:600;">🕐 Com timestamps</div>
+          <div style="color:var(--text-secondary); font-size:13px;">[mm:ss] por segmento. Útil para reuniões longas.</div>
+        </div>
+      </label>
+      <label style="display:flex; align-items:start; gap:10px; padding:10px 12px; background:var(--surface-2); border-radius:8px; cursor:pointer;">
+        <input type="radio" name="tx-mode" value="speakers" style="margin-top:2px; accent-color:var(--accent);">
+        <div>
+          <div style="font-weight:600;">🎤 Com speakers</div>
+          <div style="color:var(--text-secondary); font-size:13px;">Speaker 1/2/3… via diarização. ~2× mais lento.</div>
+        </div>
+      </label>
+    </div>
+    <label style="display:flex; align-items:center; gap:10px; padding:10px 12px; background:var(--surface-2); border-radius:8px; cursor:pointer; margin-bottom:14px;">
+      <input type="checkbox" id="paragraph-toggle" style="width:18px; height:18px; accent-color:var(--accent);">
+      <div>
+        <div style="font-weight:600;">📃 Quebrar em parágrafos</div>
+        <div style="color:var(--text-secondary); font-size:13px;">Heurística local. Insere quebras em pausas longas / pontos finais.</div>
+      </div>
+    </label>
+    <div class="modal-actions">
+      <button class="cancel" onclick="closeSettingsModal()">Cancelar</button>
+      <button class="ok" onclick="saveSettings()">Guardar</button>
     </div>
   </div>
 </div>
@@ -434,6 +477,30 @@ textOnlyToggle.addEventListener('change', e => {
 });
 function textOnlyMode() {
   return localStorage.getItem('text_only_mode') !== '0';
+}
+
+// ── Settings (transcription mode + paragraphs) ─────────────────────────
+// Persisted: localStorage.tx_mode ("plain"|"timestamps"|"speakers"),
+//            localStorage.tx_paragraphs ("1"|"0")
+let currentMode = localStorage.getItem('tx_mode') || 'timestamps';
+let paragraphsOn = localStorage.getItem('tx_paragraphs') !== '0';  // default ON
+
+function openSettingsModal() {
+  document.querySelector(`input[name="tx-mode"][value="${currentMode}"]`).checked = true;
+  document.getElementById('paragraph-toggle').checked = paragraphsOn;
+  document.getElementById('settings-modal').classList.add('show');
+}
+function closeSettingsModal() { document.getElementById('settings-modal').classList.remove('show'); }
+function saveSettings() {
+  const mode = document.querySelector('input[name="tx-mode"]:checked')?.value || 'timestamps';
+  const paras = document.getElementById('paragraph-toggle').checked;
+  currentMode = mode;
+  paragraphsOn = paras;
+  localStorage.setItem('tx_mode', mode);
+  localStorage.setItem('tx_paragraphs', paras ? '1' : '0');
+  closeSettingsModal();
+  const labels = { plain: '⚡ Texto corrido', timestamps: '🕐 Timestamps', speakers: '🎤 Speakers' };
+  showToast(`✓ Modo: ${labels[mode]}${paras ? ' + parágrafos' : ''}`);
 }
 
 // ── Modals ──────────────────────────────────────────────────────────────
@@ -767,9 +834,21 @@ async function transcribeRecording(id) {
       // Filename hint helps Mistral guess container
       const ext = rec.mime_type.includes('mp4') ? 'm4a' : 'webm';
       fd.append('file', rec.blob, `recording.${ext}`);
-      fd.append('model', MISTRAL_MODEL);
+      // Mode-specific model + flags. Diarize requires voxtral-mini-2602
+      // (not the -transcribe-2507 variant). Timestamps work on either
+      // but conflict with diarize — Mistral API rejects both together.
+      const mode = currentMode;
+      const useDiarize = (mode === 'speakers');
+      const useTimestamps = (mode === 'timestamps');
+      fd.append('model', useDiarize ? 'voxtral-mini-2602' : MISTRAL_MODEL);
       if (rec.lang_hint && rec.lang_hint !== 'auto') {
         fd.append('language', rec.lang_hint);
+      }
+      if (useDiarize) {
+        fd.append('diarize', 'true');
+      } else if (useTimestamps) {
+        // Mistral accepts JSON array as form field value
+        fd.append('timestamp_granularities', JSON.stringify(['segment']));
       }
       const t0 = performance.now();
       const res = await fetch(MISTRAL_API_URL, {
@@ -798,8 +877,38 @@ async function transcribeRecording(id) {
         throw new Error(`${res.status}: ${txt.slice(0, 200)}`);
       }
       const data = await res.json();
-      const text = (data.text || '').trim();
       const dt = ((performance.now() - t0) / 1000).toFixed(1);
+      // Format response based on requested mode. We always store the
+      // formatted version in rec.transcript; the raw API payload is
+      // kept under rec.transcript_raw so future re-formatting is
+      // possible without a new API call.
+      rec.transcript_raw = data;
+      rec.transcript_mode = mode;
+      let text;
+      if (useTimestamps && Array.isArray(data.segments) && data.segments.length) {
+        text = data.segments.map(seg => {
+          const t = fmtTime(Math.round((seg.start || 0) * 1000)).padStart(5, '0');
+          return `[${t}] ${(seg.text || '').trim()}`;
+        }).join('\n');
+      } else if (useDiarize && Array.isArray(data.segments) && data.segments.length) {
+        // Mistral returns segments with speaker labels (e.g. "speaker_0")
+        let lastSpk = null;
+        text = data.segments.map(seg => {
+          const spkRaw = seg.speaker || 'speaker_0';
+          const spkNum = (spkRaw.match(/\d+/) || ['0'])[0];
+          const label = `Speaker ${parseInt(spkNum, 10) + 1}`;
+          const prefix = (label !== lastSpk) ? `\n**${label}:** ` : ' ';
+          lastSpk = label;
+          return prefix + (seg.text || '').trim();
+        }).join('').trim();
+      } else {
+        text = (data.text || '').trim();
+      }
+      // 📃 Local paragraph break heuristic — only useful for plain mode
+      // (timestamps already have line breaks; diarize separates speakers)
+      if (mode === 'plain' && paragraphsOn) {
+        text = applyParagraphBreaks(text);
+      }
       rec.transcript = text;
       rec.transcript_status = 'done';
       rec.transcribe_dt_s = dt;
@@ -1057,7 +1166,7 @@ async function renderRecordings() {
     return `
       <div class="recording">
         <div class="recording-header">
-          <div class="recording-title">${escapeHtml(rec.profile || '(sem profile)')}</div>
+          <div class="recording-title" style="cursor:pointer;" onclick="renameRecording(${rec.id})" title="Tocar para renomear">${escapeHtml(rec.profile || '(sem profile)')} <span style="color:var(--text-secondary); font-size:11px; font-weight:400;">✏️</span></div>
           ${statusPill}
         </div>
         <div class="recording-meta">${dateStr} · ${fmtTime(rec.duration_ms)} ${audioStatus} ${rec.transcribe_dt_s ? '· transcrito em ' + rec.transcribe_dt_s + 's' : ''}</div>
@@ -1075,6 +1184,59 @@ async function renderRecordings() {
       </div>
     `;
   }).join('');
+}
+
+// ── Local paragraph break heuristic ─────────────────────────────────────
+// Splits a long continuous text into paragraphs using sentence-end
+// markers. Pure JavaScript — no Mistral call, no extra latency.
+//
+// Heuristic:
+//   - Break after sentence-end punctuation (. ! ?) followed by a space
+//     and a capital letter, BUT only after at least 200 chars in the
+//     current paragraph (avoid breaking every sentence).
+//   - Hard-break when seeing patterns of transition: "Mas", "Então",
+//     "Portanto", "Por outro lado", "Em relação a"...
+//   - Min paragraph: 150 chars (skip the rule if too short).
+function applyParagraphBreaks(text) {
+  if (!text || text.length < 300) return text;
+  // Normalise whitespace
+  let t = text.replace(/\s+/g, ' ').trim();
+  const out = [];
+  let buf = '';
+  const transitions = /\b(Mas|Então|Portanto|Por outro lado|Em relação a|Aliás|De qualquer forma|Por isso|Assim|Contudo|Todavia|Por exemplo|Quanto a|Sobre o|Vamos passar|Em resumo|Resumindo|Outra coisa|Já agora|Vamos ver|Olhem|Olha|Vejam|However|So|Therefore|But|On the other hand|Regarding|Anyway|For example|Speaking of|Moving on|In summary)\b/g;
+  // Split by sentence first
+  const sentences = t.match(/[^.!?]+[.!?]+(\s|$)/g) || [t];
+  for (const s of sentences) {
+    const sent = s.trim();
+    if (!sent) continue;
+    buf = buf ? buf + ' ' + sent : sent;
+    // Check if we should break
+    const enoughLength = buf.length >= 200;
+    // Look ahead: next sentence starts with transition word?
+    const nextIdx = sentences.indexOf(s) + 1;
+    const next = sentences[nextIdx];
+    const nextStartsTransition = next && transitions.test(next.trim().split(/\s+/)[0] || '');
+    if (enoughLength && (buf.length >= 500 || nextStartsTransition)) {
+      out.push(buf);
+      buf = '';
+    }
+  }
+  if (buf) out.push(buf);
+  // Re-join with double newlines
+  return out.length > 1 ? out.join('\n\n') : t;
+}
+
+// ── Rename recording (inline title edit) ────────────────────────────────
+async function renameRecording(id) {
+  const rec = await idbGet(id);
+  if (!rec) return;
+  const current = rec.profile || '';
+  const next = prompt('Nome desta gravação:', current);
+  if (next === null) return;  // cancelled
+  rec.profile = next.trim() || '(sem nome)';
+  await idbPut(rec);
+  await renderRecordings();
+  showToast('✓ Renomeado');
 }
 
 function escapeHtml(s) {
